@@ -30,7 +30,7 @@ configure_github_ssh() {
   local key="${GITHUB_SSH_KEY:-$HOME/.ssh/id_ed25519}"
   local tmp_ssh_askpass=""
 
-  # Check for a working SSH agent FIRST — covers agent-forwarding where the
+  # Check for a working SSH agent FIRST; this covers agent-forwarding where the
   # private key file lives only on the originating machine, not the HPC node.
   if command -v ssh-add >/dev/null 2>&1 && [ -n "${SSH_AUTH_SOCK:-}" ]; then
     if ssh-add -l >/dev/null 2>&1; then
