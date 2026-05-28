@@ -1,287 +1,262 @@
 # LFRic GCC Environment: Step-by-Step Walkthrough
 
-This document records the complete, hands-on process of installing the LFRic
-Apps Spack environment (GNU toolchain) on Isambard 3, written from a real
-install attempt. Following these steps from top to bottom will reproduce the
-stack from scratch.
+This document is a record of what was actually done to install the environment,
+written after a real install attempt on Isambard 3. Accompany this with
+`walkthrough.sh`, which is the minimal reproduction script derived from this
+experience (skipping the trial-and-error).
 
 ---
 
 ## Overview
 
-`install.sh` is the single end-to-end driver. It:
+`install.sh` is the end-to-end driver. It:
 
 1. Verifies the migrated XIOS source against the IPSL GitLab mirror.
 2. Clones `lfric_apps`, `lfric_core`, `spack`, and `simit-spack` at pinned
-   revisions into `working_dir/`.
-3. Patches `simit-spack` package definitions for Spack 1.0 compatibility.
+   revisions into `WORKING_DIR/`.
+3. Patches `simit-spack` package definitions (~30 files) for Spack 1.0
+   compatibility.
 4. Creates and concretizes a Spack environment (`lfric-apps-isambard`).
-5. Installs all ~216 packages (including papi, blitz, xios, rose, cylc, psyclone).
-6. Builds `lfric_atm` via `local_build.py` (requires SSH access to additional
-   private MetOffice repos — see below).
+5. Installs all ~216 packages.
+6. Builds `lfric_atm` from source (requires SSH to additional private repos).
 
-Spack is **not** pre-installed; `install.sh` clones it into `working_dir/spack`.
+Spack itself is **not** pre-installed. `install.sh` clones it into
+`WORKING_DIR/spack` at a pinned commit.
+
+---
+
+## What this install produces
+
+After a complete run, `activate.sh` gives:
+
+```
+rose 2.5.1
+cylc 8.6.2
+PSyclone version: 3.2.2
+```
+
+Key library versions installed:
+
+| Package | Version |
+|---------|---------|
+| mpich | 5.0.1 |
+| hdf5 | 1.14.6 |
+| netcdf-c | 4.10.0 |
+| netcdf-fortran | 4.6.2 |
+| xios | 2252 |
+| yaxt | 0.11.3 |
+| papi | 5.7.0 |
+| blitz | 1.0.2 |
+| py-psyclone | 3.2.2 |
+| metomi-rose | 2.5.1 |
+| cylc-flow | 8.6.2 |
+| cylc-rose | 1.7.0 |
+| cylc-uiserver | 1.8.3 |
+
+Disk usage: ~7.5 GB in `WORKING_DIR`.
 
 ---
 
 ## Prerequisites
 
-### System tools
+### Modules
 
-| Tool | Notes |
-|------|-------|
-| `git` | any recent version |
-| `gcc@12.3.0` | load with `module load gcc-native/12.3` |
-| `python3` | 3.x, present on login nodes |
-| `bash` | 4+ (login-node default is fine) |
-
-GCC 12.3.0 must be on `PATH` before running the installer so that `spack
-compiler find` detects it. The default system GCC on Isambard 3 login nodes is
-7.5.0; load the newer one explicitly:
+GCC 12.3.0 must be on `PATH`. The default system GCC on Isambard 3 login nodes
+is 7.5.0; load the correct version first:
 
 ```bash
 module load gcc-native/12.3
-gcc --version   # should say 12.3.0
+gcc --version   # must say 12.3.0
 ```
 
-### Storage
-
-The full install takes about **40–50 GB** of disk. Use `$SCRATCH` — `/home` is
-too small. Example:
-
-```bash
-export INSTALL_ROOT="$SCRATCH/lfric-install"
-mkdir -p "$INSTALL_ROOT"
-```
+`spack compiler find` runs inside `install.sh` and must detect `gcc@12.3.0`.
+If the module is not loaded beforehand, the install will warn and either use
+the wrong compiler or abort.
 
 ### SSH access to MetOffice GitHub
 
-`install.sh` clones three private MetOffice GitHub repositories
-(`lfric_apps`, `lfric_core`, `simit-spack`) and the `lfric_atm` build step
-clones further physics repositories (`casim`, `jules`, `socrates`). All of these
-require an SSH key that has been:
+`install.sh` clones three private MetOffice repositories:
 
-1. Added to your GitHub account.
-2. Authorized for the **MetOffice** organization via SAML SSO.
-3. Loaded into a running **SSH agent** before calling `install.sh`.
+- `MetOffice/lfric_apps`
+- `MetOffice/lfric_core`
+- `MetOffice/simit-spack`
 
-#### Step 1 — Create an SSH key (skip if you already have one)
+The `lfric_atm` build step additionally clones:
+
+- `MetOffice/casim`
+- `MetOffice/jules`
+- `MetOffice/socrates`
+
+All of these require an SSH key that is both added to your GitHub account and
+authorized for the MetOffice organization via SAML SSO.
+
+**Verify your access before starting:**
 
 ```bash
-ssh-keygen -t ed25519 -C "your.email@domain"
-# Accept the default path (~/.ssh/id_ed25519).
+ssh-add -l              # your key must appear here
+git ls-remote git@github.com:MetOffice/lfric_apps.git HEAD
 ```
 
-#### Step 2 — Start an SSH agent and load the key
+Both must succeed. If `ssh-add -l` shows no keys, load one:
 
 ```bash
 eval "$(ssh-agent -s)"
 ssh-add ~/.ssh/id_ed25519
-ssh-add -l   # confirm the key appears
 ```
 
-#### Step 3 — Add the public key to GitHub
+If `git ls-remote` fails with "Repository not found" or a 403, your key has
+not been authorized for MetOffice SSO. Go to GitHub → Settings → SSH and GPG
+keys → Configure SSO → Authorize for MetOffice.
 
-```bash
-cat ~/.ssh/id_ed25519.pub   # copy this output
+#### Critical: GIT_SSH_COMMAND must use the agent
+
+`install.sh` calls `configure_github_ssh()` which, when `GIT_SSH_COMMAND` is
+unset, builds:
+
+```
+ssh -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes -o BatchMode=yes
 ```
 
-Go to <https://github.com/settings/keys>, click **New SSH key**, paste the
-public key, and save.
+This bypasses the SSH agent and reads the key file directly. It works only if
+the key has no passphrase. For a passphrase-protected key the clone fails with
+"Permission denied (publickey)".
 
-#### Step 4 — Authorize for MetOffice SSO
-
-1. Go to <https://github.com/settings/keys>.
-2. Click **Configure SSO** next to the key you added.
-3. Click **Authorize** next to **MetOffice**.
-
-#### Step 5 — Verify access
-
-```bash
-ssh -T git@github.com
-git ls-remote git@github.com:MetOffice/lfric_apps.git HEAD
-```
-
-Both should succeed without prompting for a password.
-
-#### Critical: pre-set GIT_SSH_COMMAND
-
-`install.sh` calls `configure_github_ssh()`, which sets `GIT_SSH_COMMAND` to
-use the raw key file (`~/.ssh/id_ed25519`) with `-o IdentitiesOnly=yes` — this
-**bypasses the agent** and will fail for passphrase-protected keys. To prevent
-this, set `GIT_SSH_COMMAND` yourself before calling `install.sh`; the script
-only sets it when it is unset:
+The function only sets `GIT_SSH_COMMAND` if the variable is **unset or empty**,
+so pre-setting it prevents the override:
 
 ```bash
 export GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
 ```
 
-This tells git to use the running agent instead of the raw key file.
+This command (without `-i` or `-o IdentitiesOnly`) lets SSH try the agent
+first and fall back to default key files. The four cases:
 
----
+| Key has passphrase | SSH agent loaded | Works with pre-set command? |
+|--------------------|------------------|-----------------------------|
+| No | No | Yes — SSH reads `~/.ssh/id_ed25519` directly |
+| No | Yes | Yes — SSH uses agent |
+| Yes | Yes | Yes — SSH uses agent |
+| Yes | No | No — needs `GITHUB_SSH_PASSPHRASE` (see below) |
 
-## Get this repository
+For unattended Slurm jobs with a passphrase-protected key:
 
 ```bash
-git clone git@github.com:UniExeterRSE/Isambard3-LFRic-Env-Science-Suites.git
-cd Isambard3-LFRic-Env-Science-Suites
+export GITHUB_SSH_PASSPHRASE="your-passphrase"
+# install.sh then starts its own agent and loads the key
+```
+
+#### HTTPS alternative
+
+Set `USE_GITHUB_SSH=0` and `GITHUB_TOKEN=<token>`. The token is required
+because all MetOffice repos are private — HTTPS cloning of private repos needs
+a credential. SSH uses the key for authentication, so `GITHUB_TOKEN` is not
+needed when using SSH.
+
+### Storage
+
+Use `$SCRATCH`; `/home` is too small. A complete install uses ~7.5 GB.
+
+```bash
+export WORKING_DIR="$SCRATCH/lfric-install"
+mkdir -p "$WORKING_DIR"
 ```
 
 ---
 
-## Option A — Install on a login node
+## Running the install
+
+The install was performed on a **login node** (not a compute node) with
+`SPACK_JOBS=8`. On a login node the install takes 2–4 hours; on a compute node
+with `SPACK_JOBS=32` it is faster.
 
 ```bash
+# From the repo root:
 module load gcc-native/12.3
 export GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+export WORKING_DIR="$SCRATCH/lfric-install"
+
 cd env_lfric_gcc
-WORKING_DIR="$SCRATCH/lfric-install" SPACK_JOBS=8 \
-  bash install.sh > "$SCRATCH/lfric-install/install.log" 2>&1 &
+SPACK_JOBS=8 MAKE_JOBS=8 bash install.sh \
+  > "$WORKING_DIR/install.log" 2>&1 &
+
+tail -f "$WORKING_DIR/install.log"
 ```
 
-Follow progress in another terminal:
+### What install.sh does step by step
 
-```bash
-tail -f "$SCRATCH/lfric-install/install.log"
-```
+**1. XIOS verification**
 
-**Expected duration:** 2–4 hours on a login node. The first Spack install
-reaches ~212/216 packages before hitting the papi build failure described
-below. The second run (after the fix) takes under 30 minutes to complete the
-remaining 4 packages.
+Before cloning anything, the script runs `tests/xios_verification.sh`. It
+clones the IPSL GitLab mirror and checks the commit hash matches
+`26cc7d88e4f3fa1960461b377d9b8c82550a180e` (former SVN revision 2252). If the
+hash doesn't match, the install aborts.
 
----
+**2. Source clones**
 
-## Option B — Install on a compute node (recommended)
-
-```bash
-module load gcc-native/12.3
-export GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
-cd env_lfric_gcc
-sbatch compute_node_install.slurm
-```
-
-The Slurm job requests 1 node, 144 CPUs, 192 GB RAM, and a 12-hour wall time.
-It sets `SPACK_JOBS=32` for parallel compilation. Output goes to
-`install-lfric-apps-isambard-env.<JOBID>.out`.
-
-Monitor with:
-
-```bash
-squeue --me
-tail -f install-lfric-apps-isambard-env.*.out
-```
-
----
-
-## Known issue: papi-5.7.0 build failure on first run
-
-### Symptom
-
-The first `spack install` run fails at package 213/216 with:
-
-```
-==> papi: Executing phase: 'build'
-==> Error: ProcessError: Command exited with status 2:
-make[1]: *** No rule to make target 'no', needed by 'tests'.  Stop.
-```
-
-This cascades to: `blitz → xios → lfric-apps-isambard` all skipped.
-
-### Root cause
-
-`papi-5.7.0/package.py` appends `--with-tests=no` to configure options when
-the `~example` variant is set. On this version of papi, `--with-tests=` takes
-a test-suite name, not a boolean — the Makefile has no `no` target.
-
-`install.sh` includes a `fix_builtin_papi_tests()` function but it runs before
-Spack 1.0 downloads its package repository into `~/.spack/package_repos/`, so
-it patches the wrong copy on the first run. It self-corrects on subsequent
-runs once the directory exists.
-
-### Fix
-
-After the first failed run, find and patch the papi package:
-
-```bash
-PAPI_PKG=$(find "$HOME/.spack/package_repos" \
-  -path "*/builtin/packages/papi/package.py" -print -quit)
-echo "Patching: $PAPI_PKG"
-sed -i 's/--with-tests=no/--with-tests=/' "$PAPI_PKG"
-grep "with-tests" "$PAPI_PKG"   # should now show: --with-tests=
-```
-
-### Re-run after fix
-
-Re-run `install.sh` with the same parameters. It will skip the 212 already-
-installed packages and rebuild only papi, blitz, xios, and lfric-apps-isambard:
-
-```bash
-module load gcc-native/12.3
-export GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
-cd env_lfric_gcc
-WORKING_DIR="$SCRATCH/lfric-install" SPACK_JOBS=8 UPDATE_REPOS=0 \
-  bash install.sh > "$SCRATCH/lfric-install/install2.log" 2>&1 &
-tail -f "$SCRATCH/lfric-install/install2.log"
-```
-
-Expected packages built in the second run: `papi → blitz → xios →
-lfric-apps-isambard` (the Spack bundle), followed by the `lfric_atm` build.
-
----
-
-## What install.sh does in detail
-
-### 1. XIOS source verification
-
-The script runs `tests/xios_verification.sh` before touching Spack. It clones
-the IPSL GitLab mirror of the former SVN revision 2252 and checks the commit
-hash matches `26cc7d88e4f3fa1960461b377d9b8c82550a180e`. If verification fails,
-the install aborts.
-
-### 2. Cloning source repositories
-
-All clones land in `WORKING_DIR/` (default: `env_lfric_gcc/working_dir`).
-
-| Repository | Pinned ref | Destination |
+| Repository | Ref | Destination |
 |---|---|---|
-| `MetOffice/lfric_apps` | `e906813e...` | `working_dir/lfric_apps` |
-| `MetOffice/lfric_core` | `da8a9264...` (override) | `working_dir/lfric_core` |
-| `spack/spack` | `73eaea13...` | `working_dir/spack` |
-| `MetOffice/simit-spack` | `ece4c481...` | `working_dir/simit-spack-main` |
+| `MetOffice/lfric_apps` | `e906813e...` | `WORKING_DIR/lfric_apps` |
+| `MetOffice/lfric_core` | read from `lfric_apps/dependencies.yaml`, then overridden to `da8a9264...` | `WORKING_DIR/lfric_core` |
+| `spack/spack` | `73eaea13...` | `WORKING_DIR/spack` |
+| `MetOffice/simit-spack` | `ece4c481...` | `WORKING_DIR/simit-spack-main` |
 
-On re-runs, existing clones are kept (`UPDATE_REPOS=0` by default).
+The `lfric_core` ref is read from `lfric_apps/dependencies.yaml`, but then
+unconditionally overridden by `LFRIC_CORE_REF_OVERRIDE` (hardcoded in
+install.sh). The override exists because the ref in `dependencies.yaml` points
+to a commit that has a compile-time mismatch on Isambard 3 (see patch below).
 
-### 3. Source patches
+On re-runs, existing clone directories are kept unchanged (`UPDATE_REPOS=0` by
+default).
 
-Two patches are applied to `lfric_core` for Isambard compatibility:
+**3. lfric_core patches**
 
-- **`stop_timing` signature** in `timing_mod.F90`: adds optional
-  `timing_section_name` argument.
-- **`mpic++.mk` wrapper detection**: normalises `mpic++`/`nvc++` output to
-  known compiler IDs.
+Two patches are applied to `lfric_core` using sed/perl string substitution
+(not `.patch` files). They are idempotent — each checks whether the change is
+already present before applying.
 
-### 4. Spack bootstrap
+- **`stop_timing` signature** (`infrastructure/source/utilities/timing_mod.F90`):
+  inserts `character(*), intent(in), optional :: timing_section_name` into the
+  `stop_timing` subroutine argument list to fix a compile-time interface
+  mismatch on Isambard 3.
+- **`mpic++.mk` wrapper detection** (`infrastructure/build/cxx/mpic++.mk`):
+  rewrites the file to normalise `mpic++`/`nvc++` wrapper output to known
+  compiler IDs (`g++`, `nvc++`, etc.) so the build system picks the right C++
+  flags.
+
+These patches break if the exact lines they target change upstream; they are
+survivable maintenance items rather than design features.
+
+**4. Spack bootstrap**
 
 ```bash
-. working_dir/spack/share/spack/setup-env.sh
-spack compiler find   # detects system gcc@12.3.0
+. WORKING_DIR/spack/share/spack/setup-env.sh
+spack compiler find   # detects gcc@12.3.0
 ```
 
-### 5. simit-spack patches
+Spack 1.0 fetches its package definitions from
+`https://github.com/spack/spack-packages` into
+`~/.spack/package_repos/<hash>/` during concretize (not during bootstrap).
+This matters for the papi fix below.
 
-`simit-spack` targets an older Spack API. The installer patches ~30 package
-definitions to:
+**5. simit-spack patches**
 
-- Add `from spack.package import *` headers.
-- Rewrite `spack.pkg.builtin.*` import paths to `spack_repo.*`.
-- Fix/add definitions for `cylc-flow`, `metomi-rose`, `cylc-rose`,
+`simit-spack` targets an older Spack API. About 30 package files are patched
+by sed and Python string manipulation:
+
+- `from spack.package import *` headers added where missing.
+- Import paths rewritten from `spack.pkg.builtin.*` to `spack_repo.*`.
+- Several package definitions (`cylc-flow`, `metomi-rose`, `cylc-rose`,
   `cylc-uiserver`, `py-pyzmq`, `py-graphene`, `py-graphql-core`,
-  `py-graphql-relay`, `foxml`, and others.
+  `py-graphql-relay`, `foxml`, and others) rewritten to fix version
+  constraints, missing dependencies, or broken install hooks.
 
-### 6. Spack environment
+Like the lfric_core patches, these are text-substitution rather than
+version-controlled diffs, so they are sensitive to upstream API changes in
+simit-spack or Spack itself.
 
-The environment manifest `spack-envs/lfric-apps-isambard/spack.yaml` pins:
+**6. Spack environment**
+
+The manifest `spack-envs/lfric-apps-isambard/spack.yaml` is written/updated:
 
 ```yaml
 spack:
@@ -298,74 +273,119 @@ spack:
     - lfric-apps-isambard
 ```
 
-The `lfric-apps-isambard` bundle pulls in all LFRic dependencies.
+The `lfric-apps-isambard` bundle (local package repo) declares all LFRic
+runtime and build dependencies.
 
-### 7. Concretization and install
+**7. Concretize and install**
 
 ```bash
 spack -e lfric-apps-isambard concretize -f
-spack -e lfric-apps-isambard install -j 1 libxml2   # serial pre-phase
-spack -e lfric-apps-isambard install -j 1 yaxt      # serial (race avoidance)
+spack -e lfric-apps-isambard install -j 1 libxml2
+spack -e lfric-apps-isambard install -j 1 yaxt
 spack -e lfric-apps-isambard install -j $SPACK_JOBS node-js
 spack -e lfric-apps-isambard install -j $SPACK_JOBS
 ```
 
-After a complete second run the environment contains ~216 packages including:
+Spack's install is **genuinely incremental**: each package is stored at a
+content-addressed path (hash of spec + dependencies). Installed packages are
+recorded in `WORKING_DIR/spack/var/spack/db/`. On re-runs, any already-built
+hash is skipped outright, not just by directory existence check.
 
-| Package | Installed version |
-|---------|------------------|
-| mpich | 5.0.1 |
-| hdf5 | 1.14.6 |
-| netcdf-c | 4.10.0 |
-| netcdf-fortran | 4.6.2 |
-| xios | 2252 |
-| yaxt | 0.11.3 |
-| papi | 5.7.0 |
-| blitz | 1.0.2 |
-| py-psyclone | 3.2.2 |
-| metomi-rose | 2.5.1 |
-| cylc-flow | 8.6.2 |
-| cylc-rose | 1.7.0 |
-| cylc-uiserver | 1.8.3 |
+`libxml2` and `yaxt` are installed serially first to avoid known race
+conditions with parallel builds.
 
-### 8. Build lfric_atm
-
-With the Spack environment loaded, `local_build.py` is invoked:
+**8. lfric_atm build**
 
 ```bash
 python local_build.py lfric_atm \
     -c $WORKING_DIR/lfric_core \
-    -w $WORKING_DIR/lfric_apps/applications/lfric_atm/working \
-    -j 8 \
-    -t build \
-    -u meto-spice
+    -w $WORKING_DIR/lfric_apps/applications/lfric_atm/working/build_lfric_atm \
+    -j 8 -t build -u meto-spice
 ```
 
-**Important:** the build extracts additional physics source code from private
-MetOffice repositories (`casim`, `jules`, `socrates`) via SSH. This requires a
-live SSH agent with your MetOffice-authorized key loaded. If the agent is not
-available, the build fails at the "Extracting UM physics" step with:
-
-```
-git@github.com: Permission denied (publickey).
-RuntimeError: The command ['git', '-C', '...', 'fetch', 'origin', '2025.12.1'] failed
-```
-
-Ensure `ssh-add -l` shows your key before running install.sh.
+The `-u meto-spice` (UM_FCM_TARGET_PLATFORM) tells the build system to include
+Met Office physics packages (casim, jules, socrates). These are cloned from
+private MetOffice GitHub repos via SSH during the build. A live SSH agent with
+a MetOffice-authorized key is required at this point too.
 
 ---
 
-## Activating the environment in a new session
+## What actually happened during this install
 
-After a successful install, source `activate.sh` at the start of every new
-session before using rose, cylc, or building LFRic:
+### First run failed at papi
+
+The install got to package 213/216 then failed with:
+
+```
+==> papi: Executing phase: 'build'
+make[1]: *** No rule to make target 'no', needed by 'tests'.  Stop.
+==> Error: ProcessError: Command exited with status 2
+```
+
+`papi-5.7.0/package.py` appends `--with-tests=no` to configure options. This
+version of papi's Makefile interprets `--with-tests=` as a test-suite name, so
+`no` is treated as a target name that doesn't exist.
+
+`install.sh` has `fix_builtin_papi_tests()` for exactly this, but on a fresh
+install Spack downloads its package definitions into `~/.spack/package_repos/`
+during `spack concretize`, which runs *after* the fix was attempted. The first
+run log confirmed:
+
+```
+WARN: unable to locate builtin repo root for https://github.com/spack/spack-packages.git.
+WARN: builtin repo dir not available; skipping builtin repo fixes.
+```
+
+After the first failed run, the correct `papi/package.py` was visible in
+`~/.spack/package_repos/` and was patched manually:
+
+```bash
+PAPI_PKG=$(find "$HOME/.spack/package_repos" \
+  -path "*/builtin/packages/papi/package.py" -print -quit)
+sed -i 's/--with-tests=no/--with-tests=/' "$PAPI_PKG"
+```
+
+**This bug is now fixed in `install.sh`**: a second BUILTIN_REPO_DIR scan
+runs after `spack concretize`, so the papi fix is applied before any package
+builds. A manual workaround should not be needed on future runs from scratch.
+
+### Second run succeeded for Spack
+
+Re-running `install.sh` with `UPDATE_REPOS=0` skipped the 212 already-built
+packages (Spack's incremental behaviour) and rebuilt only:
+
+```
+papi → blitz → xios → lfric-apps-isambard (Spack bundle)
+```
+
+All 216 packages installed successfully.
+
+### lfric_atm build failed (no SSH agent)
+
+The build reached "Extracting UM physics" then failed:
+
+```
+RuntimeError: The command ['git', '-C', '...', 'fetch', 'origin', '2025.12.1'] failed
+git@github.com: Permission denied (publickey).
+```
+
+The `extract_science.py` script clones casim, jules, and socrates. At this
+point in the session there was no SSH agent running. The Spack environment
+itself was complete and functional regardless of this failure.
+
+---
+
+## Activating the environment
+
+After a successful Spack install (even if lfric_atm was not built), source
+`activate.sh`:
 
 ```bash
 SPACK_DIR="$SCRATCH/lfric-install/spack" \
   source env_lfric_gcc/activate.sh
 ```
 
-Verify the environment is loaded:
+Verify:
 
 ```bash
 rose --version      # rose 2.5.1
@@ -375,175 +395,157 @@ psyclone --version  # PSyclone version: 3.2.2
 
 `activate.sh` does the following:
 
-1. Sources `working_dir/spack/share/spack/setup-env.sh`.
-2. Activates the `lfric-apps-isambard` Spack environment.
+1. Sources `WORKING_DIR/spack/share/spack/setup-env.sh`.
+2. Activates the `lfric-apps-isambard` environment.
 3. Loads rose, cylc, psyclone, and supporting packages onto `PATH`.
-4. Sets `SHUMLIB_ROOT`, `LDFLAGS`, `LD_LIBRARY_PATH` for shumlib.
+4. Sets `SHUMLIB_ROOT`, `LDFLAGS`, `LD_LIBRARY_PATH`.
 5. Points `FC`, `MPIFC`, `F90`, `F77`, `LDMPI` at `mpif90` from MPICH.
-6. Creates/updates `~/.cylc/flow/global.cylc` with a run-directory symlink
-   under `/projects/u35v/$USER/cylc-run`.
-7. Writes `~/.cylc/flow/platforms.d/isambard3.cylc` with a Slurm platform
-   definition.
+6. Creates/updates `~/.cylc/flow/global.cylc` with a run-directory entry.
+7. Writes `~/.cylc/flow/platforms.d/isambard3.cylc` (Slurm platform definition).
 
-Override `SPACK_DIR` and `WORKING_DIR` if you installed to a non-default path:
-
-```bash
-export SPACK_DIR="$SCRATCH/lfric-install/spack"
-export WORKING_DIR="$SCRATCH/lfric-install"
-source env_lfric_gcc/activate.sh
-```
-
----
-
-## Environment validation (no build)
-
-To check that rose and cylc are accessible without triggering a full install:
-
-```bash
-./env_lfric_gcc/verification.sh > verification.log 2>&1
-```
-
----
-
-## Cylc GUI
-
-```bash
-cylc gui --no-browser
-```
-
-Open the printed URL in a browser, or forward the port via SSH if working
-remotely.
-
----
-
-## Common overrides
-
-Set these as environment variables before running `install.sh`:
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `WORKING_DIR` | `env_lfric_gcc/working_dir` | Where clones and Spack live |
-| `SPACK_JOBS` | `2` | Parallel Spack install jobs |
-| `MAKE_JOBS` | `8` | Parallel make jobs for lfric_atm build |
-| `UPDATE_REPOS` | `0` | Set to `1` to pull latest on existing clones |
-| `USE_GITHUB_SSH` | `1` | `0` to use HTTPS + `GITHUB_TOKEN` |
-| `GITHUB_SSH_KEY` | `~/.ssh/id_ed25519` | Path to your SSH key |
-| `GITHUB_SSH_PASSPHRASE` | _(empty)_ | Passphrase for non-interactive Slurm jobs |
-| `COMPILER_SPEC` | `gcc@12.3.0` | Spack compiler spec |
-| `LFRIC_APPS_REF` | `e906813e...` | `lfric_apps` git commit |
-| `SPACK_REF` | `73eaea13...` | Spack git commit |
-| `SIMIT_SPACK_REF` | `ece4c481...` | `simit-spack` git commit |
-| `REGEN_ENV` | `0` | Set to `1` to delete and recreate `spack.yaml` |
-| `RUN_ROSE_CYLC` | `1` | Set to `0` to skip rose/cylc checks |
-| `EXIT_ON_ERROR` | `0` | Set to `1` to exit the shell on failure |
-
----
-
-## Troubleshooting
-
-### SSH key not found
-
-```
-ERROR: SSH key not found at /home/.../.ssh/id_ed25519
-```
-
-Either generate a key with `ssh-keygen -t ed25519` or set:
-
-```bash
-export GITHUB_SSH_KEY=/path/to/your/key
-```
-
-### Git clone fails with "Permission denied (publickey)"
-
-If git clone fails for lfric_apps or lfric_core, install.sh may be bypassing
-your SSH agent. Pre-set `GIT_SSH_COMMAND` before calling install.sh:
-
-```bash
-export GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
-```
-
-### lfric_atm physics extraction fails (casim/jules/socrates)
-
-The `extract_science.py` step clones additional private MetOffice physics
-repos. This requires SSH access with MetOffice SSO authorization. Check:
-
-```bash
-ssh-add -l   # your key must appear here
-git ls-remote git@github.com:MetOffice/casim.git HEAD
-```
-
-For non-interactive Slurm jobs, set `GITHUB_SSH_PASSPHRASE` before submitting
-so that install.sh can start its own agent automatically.
-
-### papi-5.7.0 build failure
-
-See the dedicated section above. Short version: after the first failed run,
-run:
-
-```bash
-PAPI_PKG=$(find "$HOME/.spack/package_repos" \
-  -path "*/builtin/packages/papi/package.py" -print -quit)
-sed -i 's/--with-tests=no/--with-tests=/' "$PAPI_PKG"
-```
-
-Then re-run install.sh.
-
-### simit-spack clone fails (403 / access denied)
-
-Your GitHub account does not have access to `MetOffice/simit-spack`. Request
-access via the Met Office, or check that your SSH key is authorized for
-MetOffice SSO.
-
-### Compiler not found
-
-```
-WARN: compiler gcc@12.3.0 not found by Spack
-```
-
-Load the GCC 12 module before running the installer:
-
-```bash
-module load gcc-native/12.3
-```
-
-### Spack concretize fails with openmpi
-
-The installer detects openmpi in the concretized spec and re-concretizes with
-`--fresh` to force `mpich`. If it still appears, check that `spack.yaml` has:
-
-```yaml
-packages:
-  all:
-    providers:
-      mpi: [mpich]
-```
-
-### XIOS verification fails
-
-The IPSL GitLab mirror must be at commit
-`26cc7d88e4f3fa1960461b377d9b8c82550a180e` on branch `XIOS2`. If the mirror
-has changed, override:
-
-```bash
-export XIOS_GIT_COMMIT=<new-commit-hash>
-export XIOS_SVN_REVISION=2252
-./install.sh
-```
-
-### Cylc run directory mkdir fails (Permission denied on /projects/u35v)
-
-`activate.sh` tries to create `$CYLC_RUN_BASE` which defaults to
-`/projects/u35v/$USER/cylc-run`. If that path is not writable, set a custom
-base before sourcing:
+The Cylc run directory defaults to `/projects/u35v/$USER/cylc-run`. If that
+path is not writable, set before sourcing:
 
 ```bash
 export CYLC_RUN_BASE="$SCRATCH/cylc-run"
 source env_lfric_gcc/activate.sh
 ```
 
-### View regeneration fails
+---
 
-If `spack env view regenerate` leaves a `._view` directory behind:
+## Compute node install (recommended for speed)
+
+Submit from the `env_lfric_gcc/` directory with the agent exported:
+
+```bash
+module load gcc-native/12.3
+export GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+sbatch compute_node_install.slurm
+```
+
+`compute_node_install.slurm` sets `SPACK_JOBS=32`, requests 144 CPUs, 192 GB
+RAM, and a 12-hour wall time. Output goes to
+`install-lfric-apps-isambard-env.<JOBID>.out`.
+
+For the lfric_atm build step, the job also needs SSH access to MetOffice
+physics repos. Export `GITHUB_SSH_PASSPHRASE` to let install.sh start its own
+agent in the job:
+
+```bash
+export GITHUB_SSH_PASSPHRASE="your-passphrase"
+sbatch --export=ALL compute_node_install.slurm
+```
+
+---
+
+## Common overrides
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `WORKING_DIR` | `env_lfric_gcc/working_dir` | Where clones and Spack live |
+| `SPACK_JOBS` | `2` | Parallel Spack install jobs |
+| `MAKE_JOBS` | `8` | Parallel make jobs for lfric_atm |
+| `UPDATE_REPOS` | `0` | Set to `1` to pull/reset existing clones |
+| `USE_GITHUB_SSH` | `1` | `0` for HTTPS with `GITHUB_TOKEN` |
+| `GITHUB_SSH_KEY` | `~/.ssh/id_ed25519` | Path to SSH key |
+| `GITHUB_SSH_PASSPHRASE` | _(empty)_ | Passphrase for batch jobs |
+| `COMPILER_SPEC` | `gcc@12.3.0` | Spack compiler spec |
+| `REGEN_ENV` | `0` | Set to `1` to delete and recreate `spack.yaml` |
+
+---
+
+## Troubleshooting
+
+Issues actually encountered during this install are marked **(encountered)**.
+Others are documented for completeness but were not hit.
+
+### papi-5.7.0 build failure — **(encountered, now fixed in install.sh)**
+
+**Symptom:**
+
+```
+make[1]: *** No rule to make target 'no', needed by 'tests'.  Stop.
+```
+
+**Resolution:** The bug in `install.sh` that caused the papi fix to be skipped
+on first run has been fixed (post-concretize re-scan of `~/.spack/package_repos`).
+If for any reason it still occurs, the manual workaround is:
+
+```bash
+PAPI_PKG=$(find "$HOME/.spack/package_repos" \
+  -path "*/builtin/packages/papi/package.py" -print -quit)
+sed -i 's/--with-tests=no/--with-tests=/' "$PAPI_PKG"
+# Then re-run install.sh
+```
+
+### lfric_atm physics extraction fails — **(encountered)**
+
+**Symptom:**
+
+```
+git@github.com: Permission denied (publickey).
+RuntimeError: The command ['git', '-C', '...', 'fetch', 'origin', '2025.12.1'] failed
+```
+
+**Cause:** The lfric_atm build clones casim, jules, and socrates. No SSH agent
+was running at the time.
+
+**Resolution:** Ensure `ssh-add -l` shows a loaded key before running
+install.sh. The Spack environment is complete regardless; only the lfric_atm
+binary is missing.
+
+### Cylc run directory mkdir fails — **(encountered)**
+
+**Symptom:**
+
+```
+mkdir: cannot create directory '/projects/u35v': Permission denied
+```
+
+**Cause:** activate.sh tries to create the default Cylc run location. The
+environment still activates and rose/cylc are usable.
+
+**Resolution:**
+
+```bash
+export CYLC_RUN_BASE="$SCRATCH/cylc-run"
+source env_lfric_gcc/activate.sh
+```
+
+### GIT_SSH_COMMAND bypasses agent — hypothetical for users with passphrase
+
+Without pre-setting `GIT_SSH_COMMAND`, install.sh uses the key file directly.
+For passphrase-protected keys without an agent this fails. Pre-set:
+
+```bash
+export GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+```
+
+### Compiler not found — hypothetical
+
+```
+WARN: compiler gcc@12.3.0 not found by Spack
+```
+
+```bash
+module load gcc-native/12.3
+```
+
+### Spack concretize includes openmpi — hypothetical
+
+The installer detects this and re-concretizes with `--fresh`. If still present,
+check that `spack.yaml` has `providers: mpi: [mpich]`.
+
+### XIOS verification fails — hypothetical
+
+Override the expected commit:
+
+```bash
+export XIOS_GIT_COMMIT=<new-hash>
+./install.sh
+```
+
+### View regeneration fails — hypothetical
 
 ```bash
 rm -rf "$WORKING_DIR/spack/var/spack/environments/lfric-apps-isambard/.spack-env/._view"
