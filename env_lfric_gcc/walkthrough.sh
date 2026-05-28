@@ -1,20 +1,30 @@
 #!/usr/bin/env bash
 # walkthrough.sh — minimal reproduction of the steps in walkthrough.md.
 #
-# This script encodes exactly what was done to produce a working install,
-# stripping trial-and-error. It is meant to be read and run step by step,
-# not sourced as a library.
-#
 # Usage:
-#   bash walkthrough.sh
+#   bash env_lfric_gcc/walkthrough.sh
 #
-# The script will stop on the first error (set -e). Each numbered section
+# Override the install location:
+#   WORKING_DIR=/path/to/dir bash env_lfric_gcc/walkthrough.sh
+#
+# The script stops on the first unrecoverable error. Each numbered section
 # corresponds to a section in walkthrough.md.
+#
+# Note on install.sh exit behaviour: install.sh always exits 0 by default
+# (EXIT_ON_ERROR=0) to keep interactive shells open on failure. We therefore
+# run it with EXIT_ON_ERROR=1 so genuine errors propagate. The one expected
+# non-zero exit is the lfric_atm build, which requires SSH access to private
+# MetOffice physics repos (casim, jules, socrates). That failure is handled
+# explicitly below; the Spack environment is complete regardless.
 
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
-# 0. Configuration — edit these if your paths differ
+# 0. Configuration
+#
+#    WORKING_DIR: where all sources, Spack, and built packages land (~7.5 GB).
+#    Defaults to $SCRATCH/lfric-install. Override on the command line:
+#      WORKING_DIR=/my/path bash walkthrough.sh
 # ---------------------------------------------------------------------------
 
 WORKING_DIR="${WORKING_DIR:-$SCRATCH/lfric-install}"
@@ -23,111 +33,159 @@ MAKE_JOBS="${MAKE_JOBS:-8}"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
+echo "Install directory: $WORKING_DIR"
+echo "Spack jobs:        $SPACK_JOBS"
+
 # ---------------------------------------------------------------------------
 # 1. Load GCC 12.3.0
 #
-#    The default system GCC on Isambard 3 login nodes is 7.5.0.
-#    spack compiler find must detect gcc@12.3.0 or the install will warn and
-#    may use the wrong compiler.
+#    The login-node default is 7.5.0. spack compiler find must see 12.3.0.
 # ---------------------------------------------------------------------------
 
+echo ""
 echo "=== 1. Load gcc-native/12.3 ==="
 module load gcc-native/12.3
 gcc --version | head -1   # must say 12.3.0
 
 # ---------------------------------------------------------------------------
-# 2. Verify SSH access to MetOffice GitHub
+# 2. Verify SSH agent and MetOffice GitHub access
 #
-#    install.sh clones MetOffice/lfric_apps, lfric_core, and simit-spack.
+#    install.sh clones MetOffice/lfric_apps, lfric_core, simit-spack.
 #    The lfric_atm build step also clones casim, jules, socrates.
-#    All require an SSH key authorized for MetOffice SSO.
+#    All require an SSH key in a running agent, authorized for MetOffice SSO.
 #
-#    ssh-add -l must show at least one loaded key.
-#    git ls-remote must succeed without prompting.
+#    If ssh-add -l shows no keys:
+#      eval "$(ssh-agent -s)"
+#      ssh-add ~/.ssh/id_ed25519
+#
+#    If git ls-remote fails with "Repository not found" or 403, the key has
+#    not been authorized for MetOffice SSO via GitHub Settings → SSH keys →
+#    Configure SSO → Authorize for MetOffice.
 # ---------------------------------------------------------------------------
 
+echo ""
 echo "=== 2. Verify SSH agent and MetOffice access ==="
-ssh-add -l   # fails with exit code 1 if no agent or no keys loaded
+if ! ssh-add -l > /dev/null 2>&1; then
+  echo "ERROR: No SSH keys loaded in agent." >&2
+  echo "  Run: eval \"\$(ssh-agent -s)\" && ssh-add ~/.ssh/id_ed25519" >&2
+  exit 1
+fi
+ssh-add -l
 git ls-remote git@github.com:MetOffice/lfric_apps.git HEAD
 
 # ---------------------------------------------------------------------------
-# 3. Pre-set GIT_SSH_COMMAND so install.sh uses the agent
+# 3. Pre-set GIT_SSH_COMMAND to use the agent
 #
-#    install.sh's configure_github_ssh() sets GIT_SSH_COMMAND to:
+#    install.sh's configure_github_ssh() builds:
 #      ssh -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes -o BatchMode=yes
-#    This bypasses the agent and reads the key file directly, which fails for
-#    passphrase-protected keys.
+#    when GIT_SSH_COMMAND is unset. That bypasses the agent and reads the key
+#    file directly — failing for passphrase-protected keys.
 #
-#    The function only sets GIT_SSH_COMMAND if it is unset, so we pre-set it
-#    to let SSH use the agent instead.
+#    Pre-setting the variable prevents the override. Without -i or
+#    -o IdentitiesOnly, SSH tries the agent first and falls back to default
+#    key files, covering all cases where the agent is loaded.
 # ---------------------------------------------------------------------------
 
+echo ""
 echo "=== 3. Pre-set GIT_SSH_COMMAND ==="
 export GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
 
 # ---------------------------------------------------------------------------
 # 4. Create the working directory
-#
-#    The full install uses ~7.5 GB. $SCRATCH is used because /home is too
-#    small on Isambard 3.
 # ---------------------------------------------------------------------------
 
-echo "=== 4. Create working directory: $WORKING_DIR ==="
+echo ""
+echo "=== 4. Create working directory ==="
 mkdir -p "$WORKING_DIR"
 
 # ---------------------------------------------------------------------------
 # 5. Run install.sh
 #
-#    WORKING_DIR points the installer to $SCRATCH.
-#    SPACK_JOBS controls parallel package builds.
-#    UPDATE_REPOS=0 keeps existing clones on re-runs (idempotent).
+#    EXIT_ON_ERROR=1 makes install.sh exit non-zero on failure. By default
+#    it exits 0 to keep interactive shells open, which prevents set -e from
+#    catching problems in this script.
 #
-#    The install is run in the foreground so errors are visible immediately.
-#    On a login node with SPACK_JOBS=8 this takes 2-4 hours.
-#    Redirect to a log file and tail it in another terminal if preferred.
+#    The lfric_atm build (called inside install.sh) requires SSH access to
+#    private MetOffice physics repos (casim, jules, socrates) and commonly
+#    fails when no SSH agent is available for those repos, or when the key
+#    lacks MetOffice SSO authorization for those specific repos. That failure
+#    does NOT mean the Spack environment failed; we check them separately.
 #
-#    Note on idempotency: Spack stores each built package at a hash-addressed
-#    path in WORKING_DIR/spack/var/spack/db/ and
-#    WORKING_DIR/spack/opt/spack/. Re-running install.sh will skip any
-#    already-built hashes; it does not re-run make for them.
-#    Source-repo clones are kept as-is when UPDATE_REPOS=0.
+#    On a login node with SPACK_JOBS=8, the first fresh run takes 2-4 hours.
+#    Re-runs skip already-built Spack packages (content-addressed hashes).
+#    UPDATE_REPOS=0 keeps existing source clones untouched.
 # ---------------------------------------------------------------------------
 
+echo ""
 echo "=== 5. Run install.sh ==="
 cd "$SCRIPT_DIR"
+
+SPACK_INSTALL_OK=0
 WORKING_DIR="$WORKING_DIR" SPACK_JOBS="$SPACK_JOBS" MAKE_JOBS="$MAKE_JOBS" \
-  UPDATE_REPOS=0 \
-  bash install.sh 2>&1 | tee "$WORKING_DIR/install.log"
+  UPDATE_REPOS=0 EXIT_ON_ERROR=1 \
+  bash install.sh 2>&1 | tee "$WORKING_DIR/install.log" \
+  && SPACK_INSTALL_OK=1 || true   # capture exit without stopping the script
+
+# Check that Spack itself completed, regardless of whether lfric_atm built.
+SETUP_ENV="$WORKING_DIR/spack/share/spack/setup-env.sh"
+if [ ! -f "$SETUP_ENV" ]; then
+  echo "" >&2
+  echo "ERROR: Spack was not installed — $SETUP_ENV not found." >&2
+  echo "  The install failed before Spack was cloned. Check:" >&2
+  echo "    tail -50 $WORKING_DIR/install.log" >&2
+  exit 1
+fi
+
+# Source Spack so we can query the environment.
+# shellcheck source=/dev/null
+. "$SETUP_ENV"
+
+if ! spack -e lfric-apps-isambard find metomi-rose cylc-flow xios > /dev/null 2>&1; then
+  echo "" >&2
+  echo "ERROR: Spack environment incomplete — metomi-rose, cylc-flow, or xios missing." >&2
+  echo "  Check: spack -e lfric-apps-isambard find" >&2
+  echo "  Log:   $WORKING_DIR/install.log" >&2
+  exit 1
+fi
+
+if [ "$SPACK_INSTALL_OK" -eq 0 ]; then
+  echo ""
+  echo "NOTE: install.sh exited non-zero. Spack environment is complete." >&2
+  echo "  The lfric_atm build likely failed because the SSH agent did not have" >&2
+  echo "  access to MetOffice/casim, MetOffice/jules, or MetOffice/socrates." >&2
+  echo "  The Spack environment (rose, cylc, psyclone, xios, etc.) is usable." >&2
+fi
 
 # ---------------------------------------------------------------------------
 # 6. Verify the Spack environment
-#
-#    Even if the lfric_atm build fails (it needs a live SSH agent for
-#    casim/jules/socrates), the Spack environment is complete.
 # ---------------------------------------------------------------------------
 
+echo ""
 echo "=== 6. Verify Spack environment ==="
-SPACK_DIR="$WORKING_DIR/spack"
-. "$SPACK_DIR/share/spack/setup-env.sh"
 spack -e lfric-apps-isambard find | grep -E "(cylc-flow|metomi-rose|xios|papi|blitz)"
 
 # ---------------------------------------------------------------------------
-# 7. Activate and check tool versions
+# 7. Activate and verify tool versions
 #
-#    activate.sh sources Spack, activates the environment, and sets up PATH,
-#    FC, MPIFC, SHUMLIB_ROOT, and Cylc configuration.
-#
-#    CYLC_RUN_BASE overrides the default /projects/u35v/$USER/cylc-run, which
-#    may not be writable.
+#    CYLC_RUN_BASE overrides the default /projects/u35v/$USER/cylc-run.
+#    SPACK_DIR and WORKING_DIR are exported so activate.sh finds them.
 # ---------------------------------------------------------------------------
 
+echo ""
 echo "=== 7. Activate environment and verify versions ==="
-export CYLC_RUN_BASE="$SCRATCH/cylc-run"
+export CYLC_RUN_BASE="${CYLC_RUN_BASE:-$SCRATCH/cylc-run}"
 export SPACK_DIR="$WORKING_DIR/spack"
 export WORKING_DIR
+
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/activate.sh"
 
 rose --version
 cylc --version
 psyclone --version
+
+echo ""
+echo "=== Done ==="
+echo "To activate this environment in future sessions:"
+echo "  SPACK_DIR=$WORKING_DIR/spack WORKING_DIR=$WORKING_DIR \\"
+echo "    source $SCRIPT_DIR/activate.sh"
